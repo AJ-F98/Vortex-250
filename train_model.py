@@ -1,7 +1,11 @@
 import logging
-# Suppress logs
+import warnings
+
+# Suppress logs and warnings
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
+logging.getLogger('peewee').setLevel(logging.CRITICAL)
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import yfinance as yf
 import pandas as pd
@@ -10,6 +14,7 @@ import ta
 import lightgbm as lgb
 import joblib
 import os
+import time
 from datetime import datetime, timedelta
 from nselib import capital_market
 
@@ -24,14 +29,21 @@ MIN_AVG_VOL = 200000
 MIN_AVG_TURNOVER = 25000000
 
 def get_nifty500_symbols():
+    print("Fetching Nifty 500 symbols...")
     try:
         df = pd.read_csv(NIFTY500_URL)
-        return [f"{sym}.NS" for sym in df['Symbol'].tolist()]
-    except:
+        symbols = [f"{sym}.NS" for sym in df['Symbol'].tolist()]
+        print(f"Fetched {len(symbols)} symbols from NSE CSV.")
+        return symbols
+    except Exception as e:
+        print(f"CSV fetch failed: {e}. Trying nselib...")
         try:
             df = capital_market.nifty500_equity_list()
-            return [f"{sym}.NS" for sym in df['Symbol'].tolist()]
-        except:
+            symbols = [f"{sym}.NS" for sym in df['Symbol'].tolist()]
+            print(f"Fetched {len(symbols)} symbols from nselib.")
+            return symbols
+        except Exception as e2:
+            print(f"nselib fetch failed: {e2}")
             return []
 
 def download_data(symbols):
@@ -43,6 +55,7 @@ def download_data(symbols):
     
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i+batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(len(symbols)-1)//batch_size + 1}...", end='\r')
         try:
             data = yf.download(batch, start=start_date, group_by='ticker', auto_adjust=True, threads=True, progress=False)
             for sym in batch:
@@ -50,21 +63,22 @@ def download_data(symbols):
                     df = data[sym].copy()
                     df['Symbol'] = sym
                     
-                    # Filter check (latest close)
-                    # We keep history even if current price > 300 for robust training, 
-                    # but user asked to filter stocks where latest close <= 300.
-                    # We will filter at the end of download to save memory/processing
                     if len(df) > 0:
                         last_close = df['Close'].iloc[-1]
                         if last_close <= MAX_PRICE:
                             all_dfs.append(df)
-        except:
+        except Exception as e:
+            print(f"Batch {i} failed: {e}")
             pass
             
-    if not all_dfs: return pd.DataFrame()
+    print("") # Newline after progress
+    if not all_dfs: 
+        print("No data downloaded!")
+        return pd.DataFrame()
     
     full_df = pd.concat(all_dfs)
     full_df.reset_index(inplace=True)
+    print(f"Downloaded {len(full_df)} rows for {full_df['Symbol'].nunique()} stocks.")
     return full_df
 
 def engineer_features(df):
@@ -96,7 +110,7 @@ def engineer_features(df):
         
         # Momentum / ROC (Rate of Change)
         # ROC of shifted close
-        df[f'ROC_{w}'] = shifted_close.pct_change(w)
+        df[f'ROC_{w}'] = shifted_close.pct_change(w, fill_method=None)
         
         # Volatility
         roll_std = shifted_close.rolling(w).std()
@@ -201,7 +215,7 @@ def train_model(df):
     train_df.sort_values('Date', inplace=True)
     
     # Features
-    exclude = ['Date', 'Symbol', 'Target', 'Future_High', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close', 'Turnover', 'Is_Liquid']
+    exclude = ['Date', 'Symbol', 'Target', 'Future_High', 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close', 'Turnover', 'Is_Liquid', 'Target_Rank']
     features = [c for c in train_df.columns if c not in exclude]
     
     X = train_df[features]
@@ -239,14 +253,19 @@ def train_model(df):
     
     model.fit(X, y, group=groups)
     
-    return model, features, train_df # Return df to save filtered history
+    return model, features, df # Return full df (including latest rows with NaN target) for inference
 
 def main():
+    print("Starting training pipeline...")
     symbols = get_nifty500_symbols()
-    if not symbols: return
+    if not symbols: 
+        print("CRITICAL: Could not fetch Nifty 500 symbols. Exiting.")
+        return
     
     df = download_data(symbols)
-    if df.empty: return
+    if df.empty: 
+        print("CRITICAL: No data available. Exiting.")
+        return
     
     df = engineer_features(df)
     
@@ -260,11 +279,7 @@ def main():
     }
     joblib.dump(artifact, MODEL_FILE)
     
-    # Save filtered dataset (only liquid & valid rows, but keep history for inference context)
-    # We need history for rolling features in inference if we re-calc, 
-    # OR we just save the engineered df.
-    # User said "filtered_data.parquet (full historical data of only qualifying stocks)"
-    # We'll save the engineered df to save time in app
+    # Save filtered dataset
     filtered_df.to_parquet(DATA_FILE)
     
     print("MODEL TRAINING COMPLETED – final_model.pkl saved")
