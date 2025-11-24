@@ -1,5 +1,4 @@
 import logging
-# Suppress logs
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 
@@ -13,7 +12,7 @@ from datetime import datetime
 # Page Config
 st.set_page_config(page_title="Nexus 300 Swing System", layout="wide", initial_sidebar_state="expanded")
 
-# CSS
+# CSS for clean look
 st.markdown("""
 <style>
     .reportview-container { background: #ffffff; color: #000000; }
@@ -28,9 +27,7 @@ st.markdown("""
 MODEL_FILE = "final_model.pkl"
 DATA_FILE = "filtered_data.parquet"
 
-# -----------------------------------------------------------------------------
 # Check Files
-# -----------------------------------------------------------------------------
 if not os.path.exists(MODEL_FILE) or not os.path.exists(DATA_FILE):
     st.markdown("""
     <div style='text-align: center; color: red; margin-top: 50px;'>
@@ -39,13 +36,14 @@ if not os.path.exists(MODEL_FILE) or not os.path.exists(DATA_FILE):
     """, unsafe_allow_html=True)
     st.stop()
 
-# -----------------------------------------------------------------------------
 # Load Resources
-# -----------------------------------------------------------------------------
 @st.cache_resource
 def load_resources():
     artifact = joblib.load(MODEL_FILE)
     df = pd.read_parquet(DATA_FILE)
+    # Fix Date column for filtering (convert to datetime if needed)
+    if df['Date'].dtype == 'object':
+        df['Date'] = pd.to_datetime(df['Date']).dt.date
     return artifact, df
 
 artifact, df = load_resources()
@@ -53,147 +51,126 @@ model = artifact['model']
 features = artifact['features']
 last_updated = artifact.get('last_updated', 'Unknown')
 
-# -----------------------------------------------------------------------------
 # Sidebar
-# -----------------------------------------------------------------------------
 st.sidebar.header("Control Panel")
-max_date = df['Date'].max().date()
-selected_date = st.sidebar.date_input("Select Date", max_date)
+# Convert dates for clean calendar picker
+df['Date_pd'] = pd.to_datetime(df['Date'])
+max_date = df['Date_pd'].max().date()
+selected_date = st.sidebar.date_input("Select Date", value=max_date, format='YYYY-MM-DD')
 run_btn = st.sidebar.button("Generate Today's Signals")
 
-# -----------------------------------------------------------------------------
 # Main Screen
-# -----------------------------------------------------------------------------
 st.title("Nexus 300 Swing System")
 st.caption(f"Universe: {df['Symbol'].nunique()} stocks ≤ ₹300 | Model date: {last_updated}")
 
 if run_btn:
-    target_date = pd.Timestamp(selected_date)
+    target_date = pd.to_datetime(selected_date).date()
     
-    # 1. Filter Data up to Target Date
-    # We need history for Confidence calculation (last 252 days)
-    # But for prediction, we just need the row at target_date
-    
-    # Check if target date exists in data
-    if target_date not in df['Date'].values:
-        # Try to find nearest previous date
-        available_dates = df['Date'].unique()
-        available_dates.sort()
-        prev_dates = available_dates[available_dates <= target_date]
-        if len(prev_dates) == 0:
-            st.error("No data available for selected date.")
-            st.stop()
-        target_date = prev_dates[-1]
-        st.info(f"Using latest available data: {target_date.date()}")
+    # Find exact or nearest previous date (handles missing dates)
+    df['Date_pd'] = pd.to_datetime(df['Date'])
+    available_dates = df['Date_pd'].dt.date.unique()
+    prev_dates = [d for d in available_dates if d <= target_date]
+    if not prev_dates:
+        st.error("No data available for selected or earlier dates.")
+        st.stop()
+    target_date = max(prev_dates)  # Nearest previous
+    if target_date != pd.to_datetime(selected_date).date():
+        st.info(f"Using nearest available date: {target_date.strftime('%Y-%m-%d')}")
 
-    # Get data for prediction (Target Date)
-    daily_data = df[df['Date'] == target_date].copy()
+    # Get data for target date
+    daily_data = df[df['Date_pd'].dt.date == target_date].copy()
     
-    # Strict Filters
-    # Price <= 300
-    # Is_Liquid (Already calculated in training script)
-    mask = (daily_data['Close'] <= 300) & (daily_data['Is_Liquid'] == True)
-    candidates = daily_data[mask].copy()
-    
-    if candidates.empty:
-        st.info("No high-probability setups today (No stocks met strict criteria).")
+    if daily_data.empty:
+        st.warning(f"No data found for {target_date}.")
     else:
-        # 2. Predict Scores
-        X = candidates[features]
-        # Handle missing cols
-        for f in features:
-            if f not in X.columns: X[f] = 0
-            
-        preds = model.predict(X[features])
-        candidates['Score'] = preds
+        # Strict Filters: Price <= 300 + Liquid
+        mask = (daily_data['Close'] <= 300) & (daily_data['Is_Liquid'] == True)
+        candidates = daily_data[mask].copy()
         
-        # 3. Calculate Confidence (Historical Percentile)
-        # We need the score distribution for these candidates over the last 252 days
-        # This is expensive to calc on fly for all.
-        # Optimization: Just calculate for the top N candidates?
-        # But we need to filter by Confidence >= 75.
-        # So we must calc for all candidates.
-        
-        # Get last 252 days of data for the candidate symbols
-        start_lookback = target_date - pd.Timedelta(days=365) # Approx 1 year to get 252 trading days
-        history = df[(df['Date'] >= start_lookback) & (df['Date'] < target_date) & (df['Symbol'].isin(candidates['Symbol']))].copy()
-        
-        # We need to predict on history to get score distribution
-        # This might be slow if history is large.
-        # Let's try to do it efficiently.
-        # If history is too large, we might skip or approximate.
-        # 500 stocks * 250 days = 125k rows. LGBM is fast.
-        
-        if not history.empty:
-            X_hist = history[features]
-            for f in features:
-                if f not in X_hist.columns: X_hist[f] = 0
-            history['Score'] = model.predict(X_hist[features])
-            
-            # Calculate percentile for each candidate
-            confidence_scores = []
-            for idx, row in candidates.iterrows():
-                sym = row['Symbol']
-                current_score = row['Score']
-                hist_scores = history[history['Symbol'] == sym]['Score']
-                
-                if len(hist_scores) > 50: # Min history
-                    percentile = (hist_scores < current_score).mean() * 100
-                else:
-                    percentile = 50 # Default
-                confidence_scores.append(percentile)
-            
-            candidates['Confidence'] = confidence_scores
+        if candidates.empty:
+            st.info("No qualifying stocks today (Price > ₹300 or illiquid).")
         else:
-            candidates['Confidence'] = 50 # Fallback
+            # Predict Scores
+            X = candidates[features].fillna(0)
+            preds = model.predict(X)
+            candidates['Score'] = preds
             
-        # 4. Final Filtering
-        # Confidence >= 75
-        # Score > Historical 80th Percentile (Covered by Confidence >= 80 basically)
-        # User said: "Confidence >= 75 and Score > historical 80th percentile"
-        # Let's use Confidence >= 80 to satisfy both roughly
-        
-        final_candidates = candidates[candidates['Confidence'] >= 75].copy()
-        
-        if final_candidates.empty:
-             st.info("No high-probability setups today (Confidence Threshold not met).")
-        else:
-            # Rank by Score
-            top3 = final_candidates.sort_values('Score', ascending=False).head(3)
+            # Calculate Confidence (Historical Percentile)
+            start_lookback = target_date - pd.Timedelta(days=365)
+            history = df[(df['Date_pd'].dt.date >= start_lookback) & 
+                         (df['Date_pd'].dt.date < target_date) & 
+                         (df['Symbol'].isin(candidates['Symbol']))].copy()
             
-            results = []
-            rank = 1
-            for _, row in top3.iterrows():
-                close = row['Close']
-                
-                # Entry Logic
-                entry = close * 1.003
-                sl = entry * 0.945 # 5.5% risk
-                target = entry * 1.092 # 9.2% reward
-                
-                risk_pct = 5.5
-                reward_pct = 9.2
-                rr = 1.67
-                
-                results.append({
-                    "Rank": rank,
-                    "Symbol": row['Symbol'],
-                    "Name": row['Symbol'].replace('.NS', ''),
-                    "Close": round(close, 2),
-                    "Entry": round(entry, 2),
-                    "SL": round(sl, 2),
-                    "Target": round(target, 2),
-                    "Gain%": f"{reward_pct}%",
-                    "Hold Days": "7-18",
-                    "Risk%": f"{risk_pct}%",
-                    "RR": rr,
-                    "Confidence": int(row['Confidence'])
-                })
-                rank += 1
-                
-            res_df = pd.DataFrame(results)
-            st.table(res_df)
+            if not history.empty and len(history) > 50:
+                X_hist = history[features].fillna(0)
+                history['Score'] = model.predict(X_hist)
+                confidence_scores = []
+                for _, row in candidates.iterrows():
+                    sym = row['Symbol']
+                    current_score = row['Score']
+                    hist_scores = history[history['Symbol'] == sym]['Score']
+                    if len(hist_scores) >= 50:
+                        percentile = (hist_scores < current_score).mean() * 100
+                    else:
+                        percentile = 50
+                    confidence_scores.append(percentile)
+                candidates['Confidence'] = confidence_scores
+            else:
+                candidates['Confidence'] = 50  # Fallback
             
-            # Export
-            csv = res_df.to_csv(index=False).encode('utf-8')
-            st.download_button("Export CSV", csv, "signals.csv", "text/csv")
+            # High-Conviction Filter (Confidence >= 75)
+            final_candidates = candidates[candidates['Confidence'] >= 75].copy()
+            
+            if final_candidates.empty:
+                st.info("No high-probability setups today (Confidence < 75%).")
+            else:
+                # Generate Trade Parameters
+                final_candidates['Entry'] = (final_candidates['Close'] * 1.003).round(2)
+                final_candidates['SL'] = (final_candidates['Entry'] * 0.945).round(2)  # ~5.5% risk
+                final_candidates['Target'] = (final_candidates['Entry'] * 1.092).round(2)  # ~9.2% reward
+                final_candidates['Risk%'] = 5.5
+                final_candidates['Reward%'] = 9.2
+                final_candidates['RR'] = 1.67
+                final_candidates['Confidence'] = final_candidates['Confidence'].round(0).astype(int)
+                
+                # Prepare Display Table (All Signals)
+                display_df = final_candidates[['Symbol', 'Close', 'Entry', 'SL', 'Target', 
+                                               'Reward%', 'Risk%', 'RR', 'Confidence', 'Score']].copy()
+                display_df['Symbol'] = display_df['Symbol'].str.replace('.NS', '')
+                display_df = display_df.rename(columns={
+                    'Symbol': 'Symbol',
+                    'Close': 'Close ₹',
+                    'Entry': 'Entry ₹',
+                    'SL': 'Stop Loss ₹',
+                    'Target': 'Target ₹',
+                    'Score': 'Raw Score'
+                }).round(2)
+                
+                st.success(f"**{len(display_df)} High-Conviction Signals Found** (All with Confidence ≥ 75%)")
+                
+                # Fully Sortable + Searchable Table
+                st.dataframe(
+                    display_df.sort_values("Confidence", ascending=False),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Confidence": st.column_config.ProgressColumn(
+                            "Confidence %",
+                            help="Historical percentile strength (Higher = Rarer/Better Edge)",
+                            format="%d%%",
+                            min_value=0,
+                            max_value=100,
+                        )
+                    }
+                )
+                
+                # Export All Signals
+                csv = display_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "📥 Export All Signals (CSV)", 
+                    csv, 
+                    f"nexus300_signals_{target_date.strftime('%Y-%m-%d')}.csv", 
+                    "text/csv"
+                )
+
+st.sidebar.caption(f"Model: {last_updated} | Universe: {df['Symbol'].nunique()} stocks")
